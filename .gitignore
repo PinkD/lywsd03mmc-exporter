@@ -1,0 +1,4 @@
+# jetbrains ide
+.idea/
+# build output
+lywsd03mmc-exporter

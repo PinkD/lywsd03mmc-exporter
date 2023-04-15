@@ -8,11 +8,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -21,13 +21,12 @@ import (
 
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/examples/lib/dev"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"crypto/aes"
-	"github.com/pschlump/AesCCM"
+	"github.com/pschlump/aesccm"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var (
@@ -53,7 +52,7 @@ var (
 			"mac",
 		},
 	)
-	battGauge = promauto.NewGaugeVec(
+	batteryGauge = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "thermometer",
 			Name:      "battery_ratio",
@@ -113,6 +112,8 @@ var expirers = make(map[string]*time.Timer)
 var expirersLock sync.Mutex
 
 func bump(mac string, expiry time.Duration) {
+	// TODO: I don't know what does this mean so just ignore this for now
+	return
 	expirersLock.Lock()
 	if t, ok := expirers[mac]; ok {
 		t.Reset(expiry)
@@ -121,7 +122,7 @@ func bump(mac string, expiry time.Duration) {
 			fmt.Printf("expiring %s\n", mac)
 			tempGauge.DeleteLabelValues(Sensor, mac)
 			humGauge.DeleteLabelValues(Sensor, mac)
-			battGauge.DeleteLabelValues(Sensor, mac)
+			batteryGauge.DeleteLabelValues(Sensor, mac)
 			voltGauge.DeleteLabelValues(Sensor, mac)
 			frameGauge.DeleteLabelValues(Sensor, mac)
 			rssiGauge.DeleteLabelValues(Sensor, mac)
@@ -150,7 +151,26 @@ func macWithoutColons(mac string) string {
 
 var decryptionKeys = make(map[string][]byte)
 
-func decryptData(data []byte, frameMac string, rssi int) {
+func decryptKey(key, nonce, data []byte) []byte {
+	cipher, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+	ccm, err := aesccm.NewCCM(cipher, 4, 12)
+	if err != nil {
+		panic(err)
+	}
+
+	var Aad = []byte{0x11}
+
+	dst, err := ccm.Open([]byte{}, nonce, data, Aad)
+	if err != nil {
+		panic(err)
+	}
+	return dst
+}
+
+func parseData(data []byte, frameMac string, rssi int) {
 	if len(data) < 11+3+4 {
 		return
 	}
@@ -165,54 +185,38 @@ func decryptData(data []byte, frameMac string, rssi int) {
 
 	key, ok := decryptionKeys[mac]
 	if !ok {
-		log.Printf("no key for MAC %s, skipped\n", mac)
+		logger.Infof("no key for MAC %s, skipped\n", mac)
 		return
 	}
 
-	ciphertext := []byte{}
+	var ciphertext []byte
 	ciphertext = append(ciphertext, data[11:len(data)-7]...) // payload
 	ciphertext = append(ciphertext, data[len(data)-4:]...)   // token
 
-	nonce := []byte{}
+	var nonce []byte
 	nonce = append(nonce, data[5:11]...)                    // reverse MAC
 	nonce = append(nonce, data[2:5]...)                     // sensor type
 	nonce = append(nonce, data[len(data)-7:len(data)-4]...) // counter
 
-	aes, err := aes.NewCipher(key[:])
-	if err != nil {
-		log.Print("aes.NewCipher: ", err)
-		return
-	}
-	ccm, err := aesccm.NewCCM(aes, 4, 12)
-	if err != nil {
-		log.Fatal("aesccm.NewCCM: ", err)
-	}
-
-	var Aad = []byte{0x11}
-
-	dst, err := ccm.Open([]byte{}, nonce, ciphertext, Aad)
-	if err != nil {
-		log.Print("couldn't decrypt: ", err)
-		return
-	}
-
 	bump(mac, ExpiryStock)
 
-	if dst[0] == 0x04 { // temperature
+	dst := decryptKey(key[:], nonce, data)
+
+	switch dst[0] {
+	case 0x04:
 		temp := float64(binary.LittleEndian.Uint16(dst[3:5])) / 10.0
-		logTemperature(mac, temp)
-
-	}
-	if dst[0] == 0x06 { // humidity
-		hum := float64(binary.LittleEndian.Uint16(dst[3:5])) / 10.0
-		logHumidity(mac, hum)
-	}
-	if dst[0] == 0x0A { // battery
+		reportTemperature(mac, temp)
+		logger.Debugf("temperature for %s from advertisement: %f", mac, temp)
+	case 0x06:
+		humidity := float64(binary.LittleEndian.Uint16(dst[3:5])) / 10.0
+		reportHumidity(mac, humidity)
+		logger.Debugf("humidity for %s from advertisement: %f", mac, humidity)
+	case 0x0A:
 		// XXX always 100%?
-		batp := float64(dst[3])
-		logBatteryPercent(mac, batp)
+		batteryPercentage := float64(dst[3])
+		reportBatteryPercent(mac, batteryPercentage)
+		logger.Debugf("battery percent for %s from advertisement: %f", mac, batteryPercentage)
 	}
-
 	rssiGauge.WithLabelValues(Sensor, mac).Set(float64(rssi))
 }
 
@@ -236,17 +240,20 @@ func registerData(data []byte, frameMac string, rssi int) {
 	}
 
 	temp := float64(decodeSign(binary.BigEndian.Uint16(data[6:8]))) / 10.0
-	hum := float64(data[8])
-	batp := float64(data[9])
-	batv := float64(binary.BigEndian.Uint16(data[10:12])) / 1000.0
+	humidity := float64(data[8])
+	batPercentage := float64(data[9])
+	batVoltage := float64(binary.BigEndian.Uint16(data[10:12])) / 1000.0
 	frame := float64(data[12])
 
 	bump(mac, ExpiryAtc)
 
-	logTemperature(mac, temp)
-	logHumidity(mac, hum)
-	logBatteryPercent(mac, batp)
-	logVoltage(mac, batv)
+	reportTemperature(mac, temp)
+	reportHumidity(mac, humidity)
+	reportBatteryPercent(mac, batPercentage)
+	reportVoltage(mac, batVoltage)
+
+	logger.Debugf("metric for %s from advertisement: temperature %f, humidity %f, battery percent %f, battery voltage %f",
+		mac, temp, humidity, batPercentage, batVoltage)
 
 	frameGauge.WithLabelValues(Sensor, mac).Set(frame)
 	rssiGauge.WithLabelValues(Sensor, mac).Set(float64(rssi))
@@ -260,7 +267,7 @@ func advHandler(a ble.Advertisement) {
 			registerData(sd.Data, mac, a.RSSI())
 		}
 		if sd.UUID.Equal(XiaomiIncUUID) {
-			decryptData(sd.Data, mac, a.RSSI())
+			parseData(sd.Data, mac, a.RSSI())
 		}
 	}
 }
@@ -268,7 +275,7 @@ func advHandler(a ble.Advertisement) {
 func loadKeys(filename string) {
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer file.Close()
 
@@ -282,50 +289,52 @@ func loadKeys(filename string) {
 		}
 		fields := strings.SplitN(line, " ", 2)
 		if len(fields[0]) != 12 || len(fields[1]) != 32 {
-			log.Print("invalid config line, ignored: ", line)
+			logger.Warnf("invalid config line, ignored: %s", line)
 			continue
 		}
 		mac := fields[0]
 		key, err := hex.DecodeString(fields[1])
 		if err != nil {
-			log.Print("invalid config line, ignored: ", line)
+			logger.Warnf("invalid config line, ignored: %s", line)
 			continue
 		}
 		decryptionKeys[mac] = key
 	}
 }
 
-func logTemperature(mac string, temp float64) {
+func reportTemperature(mac string, temp float64) {
 	tempGauge.WithLabelValues(Sensor, mac).Set(temp)
-	log.Printf("%s thermometer_temperature_celsius %.1f\n", mac, temp)
+	logger.Debugf("%s thermometer_temperature_celsius %.1f\n", mac, temp)
 }
 
-func logHumidity(mac string, hum float64) {
+func reportHumidity(mac string, hum float64) {
 	humGauge.WithLabelValues(Sensor, mac).Set(hum)
-	log.Printf("%s thermometer_humidity_ratio %.0f\n", mac, hum)
+	logger.Debugf("%s thermometer_humidity_ratio %.0f\n", mac, hum)
 }
 
-func logVoltage(mac string, batv float64) {
+func reportVoltage(mac string, batv float64) {
 	voltGauge.WithLabelValues(Sensor, mac).Set(batv)
-	log.Printf("%s thermometer_battery_volts %.3f\n", mac, batv)
+	logger.Debugf("%s thermometer_battery_volts %.3f\n", mac, batv)
 }
 
-func logBatteryPercent(mac string, batp float64) {
-	battGauge.WithLabelValues(Sensor, mac).Set(batp)
-	log.Printf("%s thermometer_battery_ratio %.0f\n", mac, batp)
+func reportBatteryPercent(mac string, batp float64) {
+	batteryGauge.WithLabelValues(Sensor, mac).Set(batp)
+	logger.Debugf("%s thermometer_battery_ratio %.0f\n", mac, batp)
 }
 
 func decodeStockCharacteristic(mac string) func(req []byte) {
 	return func(req []byte) {
 		temp := float64(int(binary.LittleEndian.Uint16(req[0:2]))) / 100.0
-		hum := float64(req[2])
-		batv := float64(int(binary.LittleEndian.Uint16(req[3:5]))) / 1000.0
+		humidity := float64(req[2])
+		batVoltage := float64(int(binary.LittleEndian.Uint16(req[3:5]))) / 1000.0
 
 		bump(mac, ExpiryConn)
 
-		logTemperature(mac, temp)
-		logHumidity(mac, hum)
-		logVoltage(mac, batv)
+		reportTemperature(mac, temp)
+		reportHumidity(mac, humidity)
+		reportVoltage(mac, batVoltage)
+		logger.Debugf("metric for %s from ble client: temperature %f, humidity %f, battery voltage %f",
+			mac, temp, humidity, batVoltage)
 	}
 }
 
@@ -333,23 +342,26 @@ func decodeAtcTemp(mac string) func(req []byte) {
 	return func(req []byte) {
 		temp := float64(decodeSign(binary.LittleEndian.Uint16(req[0:2]))) / 10.0
 		bump(mac, ExpiryConn)
-		logTemperature(mac, temp)
+		reportTemperature(mac, temp)
+		logger.Debugf("temperature for %s from ble client: %f", mac, temp)
 	}
 }
 
 func decodeAtcHumidity(mac string) func(req []byte) {
 	return func(req []byte) {
-		hum := float64(binary.LittleEndian.Uint16(req[0:2])) / 100.0
+		humidity := float64(binary.LittleEndian.Uint16(req[0:2])) / 100.0
 		bump(mac, ExpiryConn)
-		logHumidity(mac, hum)
+		reportHumidity(mac, humidity)
+		logger.Debugf("humidity for %s from ble client: %f", mac, humidity)
 	}
 }
 
 func decodeAtcBattery(mac string) func(req []byte) {
 	return func(req []byte) {
-		batp := float64(req[0])
+		batteryPercent := float64(req[0])
 		bump(mac, ExpiryConn)
-		logBatteryPercent(mac, batp)
+		reportBatteryPercent(mac, batteryPercent)
+		logger.Debugf("battery percentage for %s from ble client: %f", mac, batteryPercent)
 	}
 }
 
@@ -357,64 +369,53 @@ func pollData(mac string) {
 	mac = macWithoutColons(mac)
 
 	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), 50*time.Second))
-
 	client, err := ble.Dial(ctx, ble.NewAddr(macWithColons(mac)))
 	if err != nil {
-		log.Fatal("oops: ", err)
+		panic(err)
 	}
 	profile, err := client.DiscoverProfile(true)
 	if err != nil {
-		log.Fatal("oops: ", err)
+		panic(err)
 	}
 
 	// code for stock hardware
-
 	clientCharacteristicConfiguration := ble.MustParse("00002902-0000-1000-8000-00805f9b34fb")
 	if c := profile.FindCharacteristic(ble.NewCharacteristic(clientCharacteristicConfiguration)); c != nil {
 		b := []byte{0x01, 0x00}
 		err := client.WriteCharacteristic(c, b, false)
-		fmt.Printf("%v\n", err)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	subscribeCharacteristic := func(uuid ble.UUID, handler ble.NotificationHandler) {
+		if c := profile.FindCharacteristic(ble.NewCharacteristic(uuid)); c != nil {
+			err := client.Subscribe(c, false, handler)
+			if err != nil {
+				panic(err)
+			}
+		}
 	}
 
 	stockDataCharacteristic := ble.MustParse("ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6")
-	if c := profile.FindCharacteristic(ble.NewCharacteristic(stockDataCharacteristic)); c != nil {
-		err := client.Subscribe(c, false, decodeStockCharacteristic(mac))
-		if err != nil {
-			log.Print(err)
-		}
-	}
-
+	subscribeCharacteristic(stockDataCharacteristic, decodeStockCharacteristic(mac))
 	// code for custom hardware
-
 	batteryServiceBatteryLevel := ble.UUID16(0x2a19)
-	if c := profile.FindCharacteristic(ble.NewCharacteristic(batteryServiceBatteryLevel)); c != nil {
-		err := client.Subscribe(c, false, decodeAtcBattery(mac))
-		if err != nil {
-			log.Print(err)
-		}
-	}
-
+	subscribeCharacteristic(batteryServiceBatteryLevel, decodeAtcBattery(mac))
 	environmentalSensingTemperatureCelsius := ble.UUID16(0x2a1f)
-	if c := profile.FindCharacteristic(ble.NewCharacteristic(environmentalSensingTemperatureCelsius)); c != nil {
-		err := client.Subscribe(c, false, decodeAtcTemp(mac))
-		if err != nil {
-			log.Print(err)
-		}
-	}
-
+	subscribeCharacteristic(environmentalSensingTemperatureCelsius, decodeAtcTemp(mac))
 	environmentalSensingHumidity := ble.UUID16(0x2a6f)
-	if c := profile.FindCharacteristic(ble.NewCharacteristic(environmentalSensingHumidity)); c != nil {
-		err := client.Subscribe(c, false, decodeAtcHumidity(mac))
-		if err != nil {
-			log.Print(err)
-		}
-	}
+	subscribeCharacteristic(environmentalSensingHumidity, decodeAtcHumidity(mac))
 }
 
+var logger *zap.SugaredLogger
+
 func main() {
+
 	config := flag.String("k", "", "load keys from `file`")
 	listenAddr := flag.String("l", ":9265", "listen on `addr`")
 	deviceID := flag.Int("i", 0, "use device hci`N`")
+	level := flag.String("log-level", "info", "log level")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [FLAGS...] [MACS TO POLL...]\n", os.Args[0])
@@ -426,9 +427,16 @@ func main() {
 		loadKeys(*config)
 	}
 
+	c := zap.NewProductionConfig()
+	c.Encoding = "console"
+	c.Level, _ = zap.ParseAtomicLevel(*level)
+	c.EncoderConfig.EncodeTime = zapcore.RFC3339TimeEncoder
+	l, _ := c.Build()
+	logger = l.Sugar()
+
 	device, err := dev.NewDevice("default", ble.OptDeviceID(*deviceID))
 	if err != nil {
-		log.Fatal("oops: ", err)
+		panic(err)
 	}
 
 	ble.SetDefaultDevice(device)
@@ -439,11 +447,10 @@ func main() {
 			w.Write([]byte(`<html><head><title>lywsd03mmc-exporter</title></head><body><h1>lywsd03mmc-exporter</h1><p><a href="/metrics">Metrics</a></p></body></html>`))
 		})
 		http.Handle("/metrics", promhttp.Handler())
-		log.Println("Prometheus metrics listening on", *listenAddr)
+		logger.Infof("Prometheus metrics listening on %s", *listenAddr)
 		err := http.ListenAndServe(*listenAddr, nil)
 		if err != http.ErrServerClosed {
-			log.Fatal(err)
-			os.Exit(1)
+			panic(err)
 		}
 	}()
 
@@ -458,6 +465,6 @@ func main() {
 	}
 	err = ble.Scan(ctx, true, advHandler, telinkVendorFilter)
 	if err != nil {
-		log.Fatal("oops: %s", err)
+		panic(err)
 	}
 }
