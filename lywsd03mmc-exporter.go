@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"sync"
@@ -112,24 +113,18 @@ var expirers = make(map[string]*time.Timer)
 var expirersLock sync.Mutex
 
 func bump(mac string, expiry time.Duration) {
-	// TODO: I don't know what does this mean so just ignore this for now
-	return
 	expirersLock.Lock()
 	if t, ok := expirers[mac]; ok {
 		t.Reset(expiry)
 	} else {
 		expirers[mac] = time.AfterFunc(expiry, func() {
 			fmt.Printf("expiring %s\n", mac)
-			tempGauge.DeleteLabelValues(Sensor, mac)
-			humGauge.DeleteLabelValues(Sensor, mac)
-			batteryGauge.DeleteLabelValues(Sensor, mac)
-			voltGauge.DeleteLabelValues(Sensor, mac)
-			frameGauge.DeleteLabelValues(Sensor, mac)
-			rssiGauge.DeleteLabelValues(Sensor, mac)
 
 			expirersLock.Lock()
-			delete(expirers, mac)
+			expirers[mac].Reset(expiry)
 			expirersLock.Unlock()
+			cancel()
+			initContext()
 		})
 	}
 	expirersLock.Unlock()
@@ -410,8 +405,14 @@ func pollData(mac string) {
 
 var logger *zap.SugaredLogger
 
-func main() {
+var globalCtx context.Context
+var cancel context.CancelFunc
 
+func initContext() {
+	globalCtx, cancel = context.WithCancel(context.TODO())
+}
+
+func main() {
 	config := flag.String("k", "", "load keys from `file`")
 	listenAddr := flag.String("l", ":9265", "listen on `addr`")
 	deviceID := flag.Int("i", 0, "use device hci`N`")
@@ -458,13 +459,18 @@ func main() {
 		go pollData(mac)
 	}
 
-	ctx := ble.WithSigHandler(context.Background(), nil)
+	initContext()
+	ctx := ble.WithSigHandler(globalCtx, nil)
 
 	telinkVendorFilter := func(a ble.Advertisement) bool {
 		return strings.HasPrefix(a.Addr().String(), TelinkVendorPrefix)
 	}
-	err = ble.Scan(ctx, true, advHandler, telinkVendorFilter)
-	if err != nil {
-		panic(err)
+	for {
+		err = ble.Scan(ctx, true, advHandler, telinkVendorFilter)
+		if err != nil {
+			logger.Error(err)
+		}
+		time.Sleep(30 * time.Second)
+		ctx = ble.WithSigHandler(globalCtx, nil)
 	}
 }
